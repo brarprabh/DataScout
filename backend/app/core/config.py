@@ -1,5 +1,10 @@
+import os
 from typing import List
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Determine absolute path to .env in project root or current directory
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+ENV_PATH = os.path.join(PROJECT_ROOT, ".env") if os.path.exists(os.path.join(PROJECT_ROOT, ".env")) else ".env"
 
 
 class Settings(BaseSettings):
@@ -11,10 +16,10 @@ class Settings(BaseSettings):
     CHROMA_PERSIST_DIR: str = "backend/data/chroma_db"
     EMBEDDING_MODEL: str = "gemini-embedding-001"
     LLM_MODEL: str = "gemini-3.1-flash-lite"
-    CORS_ORIGINS: List[str] = ["http://localhost:5173"]
+    CORS_ORIGINS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173"]
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=ENV_PATH,
         env_file_encoding="utf-8",
         extra="ignore"
     )

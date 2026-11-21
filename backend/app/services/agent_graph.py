@@ -1,5 +1,6 @@
 import json
 import logging
+import time
 from typing import List, Optional, TypedDict
 from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, END
@@ -25,9 +26,28 @@ class AgentState(TypedDict):
     answer: str
 
 
-class RelevanceGrade(BaseModel):
-    is_relevant: bool = Field(description="Whether the chunk contains facts relevant to answering the query")
-    explanation: str = Field(description="Brief explanation of why the chunk is or is not relevant")
+class ChunkGrade(BaseModel):
+    chunk_index: int = Field(description="1-based index of the snippet")
+    is_relevant: bool = Field(description="Whether the snippet contains facts relevant to answering the question")
+
+
+class BatchRelevanceGrade(BaseModel):
+    grades: List[ChunkGrade] = Field(description="List of relevance judgements for each evaluated snippet")
+
+
+def generate_content_with_retry(client, model: str, contents: str, config=None, max_retries: int = 3):
+    """Executes client.models.generate_content with exponential backoff on 503 or transient errors."""
+    for attempt in range(max_retries):
+        try:
+            return client.models.generate_content(model=model, contents=contents, config=config)
+        except Exception as e:
+            err_msg = str(e)
+            if ("503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg) and attempt < max_retries - 1:
+                wait_sec = (attempt + 1) * 2
+                logger.warning(f"503 received from Gemini API. Retrying in {wait_sec}s (attempt {attempt + 1}/{max_retries})...")
+                time.sleep(wait_sec)
+            else:
+                raise e
 
 
 def get_gemini_client():
@@ -36,12 +56,13 @@ def get_gemini_client():
     return genai.Client(api_key=settings.GEMINI_API_KEY)
 
 
-# Node 1: retrieve_kb
+# Node 1: retrieve_kb (Optimized to top 3 chunks for high-speed evaluation)
 def retrieve_kb(state: AgentState) -> dict:
     query = state.get("rewritten_query") or state["question"]
     trace_steps = list(state.get("trace_steps", []))
     
-    chunks = hybrid_engine.hybrid_search(query, top_k=5)
+    # Prune to top 3 chunks for fast RRF retrieval & minimal latency
+    chunks = hybrid_engine.hybrid_search(query, top_k=3)
     step_msg = f"Retrieved {len(chunks)} chunks via Hybrid RRF for query: '{query}'"
     trace_steps.append(step_msg)
     
@@ -51,7 +72,7 @@ def retrieve_kb(state: AgentState) -> dict:
     }
 
 
-# Node 2: grade_relevance
+# Node 2: grade_relevance (Single-Prompt Batch Grading)
 def grade_relevance(state: AgentState) -> dict:
     question = state["question"]
     chunks = list(state.get("chunks", []))
@@ -62,43 +83,54 @@ def grade_relevance(state: AgentState) -> dict:
         return {"chunks": [], "trace_steps": trace_steps}
 
     client = get_gemini_client()
-    graded_chunks = []
-    relevant_count = 0
 
-    for chunk in chunks:
-        prompt = f"""You are a strict retrieval evaluator.
-Determine if the following context snippet contains information relevant to answering the question.
+    # Build single consolidated evaluation prompt for all chunks
+    snippets_text = "\n\n".join(
+        [f"[Snippet {i + 1} - ID: {c.chunk_id}]\n{c.text}" for i, c in enumerate(chunks)]
+    )
+
+    prompt = f"""You are an auditable technical retrieval grader.
+Evaluate whether each of the following context snippets contains information relevant to answering the question.
 
 Question:
 {question}
 
-Context Snippet:
-{chunk.text}
-"""
-        try:
-            response = client.models.generate_content(
-                model=settings.LLM_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    response_schema=RelevanceGrade,
-                    temperature=0.0
-                )
-            )
-            parsed = json.loads(response.text)
-            is_rel = bool(parsed.get("is_relevant", False))
-        except Exception as e:
-            logger.warning(f"Grading failed for chunk {chunk.chunk_id}: {e}")
-            is_rel = False
+Context Snippets:
+{snippets_text}
 
+For each snippet from 1 to {len(chunks)}, determine if it is relevant (true) or not (false)."""
+
+    grade_map = {}
+    try:
+        response = generate_content_with_retry(
+            client=client,
+            model=settings.LLM_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=BatchRelevanceGrade,
+                temperature=0.0
+            )
+        )
+        parsed = json.loads(response.text)
+        for item in parsed.get("grades", []):
+            idx = item.get("chunk_index")
+            if idx is not None and 1 <= idx <= len(chunks):
+                grade_map[idx - 1] = bool(item.get("is_relevant", False))
+    except Exception as e:
+        logger.warning(f"Batch grading fallback triggered: {e}")
+
+    graded_chunks = []
+    relevant_count = 0
+    for i, chunk in enumerate(chunks):
+        is_rel = grade_map.get(i, False)
         chunk_dict = chunk.model_dump()
         chunk_dict["is_relevant"] = is_rel
-        graded_chunk = ChunkResult(**chunk_dict)
-        graded_chunks.append(graded_chunk)
+        graded_chunks.append(ChunkResult(**chunk_dict))
         if is_rel:
             relevant_count += 1
 
-    trace_steps.append(f"Graded relevance: {relevant_count}/{len(chunks)} chunks judged relevant")
+    trace_steps.append(f"Graded relevance: {relevant_count}/{len(chunks)} chunks judged relevant (batch evaluated)")
     return {
         "chunks": graded_chunks,
         "trace_steps": trace_steps
@@ -137,7 +169,8 @@ Original Query:
 Rewritten Query:"""
 
     try:
-        response = client.models.generate_content(
+        response = generate_content_with_retry(
+            client=client,
             model=settings.LLM_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(temperature=0.3)
@@ -205,7 +238,8 @@ User Question:
 
 Answer:"""
         try:
-            response = client.models.generate_content(
+            response = generate_content_with_retry(
+                client=client,
                 model=settings.LLM_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.2)
@@ -237,7 +271,8 @@ User Question:
 
 Answer:"""
         try:
-            response = client.models.generate_content(
+            response = generate_content_with_retry(
+                client=client,
                 model=settings.LLM_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(temperature=0.2)

@@ -17,7 +17,7 @@ VeriRAG is a self-correcting, auditable Hybrid RAG engineering workbench built f
   4. `web_fallback`: If KB results remain weak after retry, search the live web via Tavily (`tavily-python`) and synthesize a web-grounded answer clearly tagged as `source_mode="web_fallback"` with source URLs
   5. `generate_answer`: Synthesize a grounded answer with inline citations `[filename · p.X]`[cite: 1]
 - **Lightweight Hackathon Storage & Cache:** In-memory Python dict cache (simulating Redis hit/miss telemetry) and local ChromaDB + JSON metadata (skip PostgreSQL/Docker until after the hackathon demo)[cite: 1].
-- **Frontend:** React + TypeScript + Tailwind CSS + Lucide React + Recharts (`frontend/`), styled in a **Swiss Technical Grid** aesthetic (`#F6F5F0` off-white background, `#111111` ink, `1px` `#D4D2C8` borders, `#FF4F00` signal-orange accents, `JetBrains Mono` metrics, zero dark-mode AI slop/glassmorphism).
+- **Frontend:** React (JavaScript .jsx) + Tailwind CSS + Lucide React + Recharts (`frontend/`), styled in a **Swiss Technical Grid** aesthetic (`#F6F5F0` off-white background, `#111111` ink, `1px` `#D4D2C8` borders, `#FF4F00` signal-orange accents, `JetBrains Mono` metrics, zero dark-mode AI slop/glassmorphism).
 
 ## 3. Directory Map
 - `backend/app/core/config.py` — Pydantic settings loading `.env` (`GEMINI_API_KEY`, `CHUNK_SIZE=500`, `CHUNK_OVERLAP=50`, `RRF_K=60`)

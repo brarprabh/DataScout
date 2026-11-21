@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     GEMINI_API_KEY: str = ""
+    TAVILY_API_KEY: str = ""
     CHUNK_SIZE: int = 500
     CHUNK_OVERLAP: int = 50
     RRF_K: int = 60

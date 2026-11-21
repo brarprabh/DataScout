@@ -14,7 +14,7 @@ VeriRAG is a self-correcting, auditable Hybrid RAG engineering workbench built f
   1. `retrieve_kb`: Run Hybrid RRF search on uploaded PDFs[cite: 1]
   2. `grade_relevance`: Use `gemini-2.5-flash` to judge if retrieved chunks actually answer the query[cite: 1]
   3. `rewrite_query`: If KB relevance is weak (first attempt), rewrite the query for better technical recall and retry `retrieve_kb` once[cite: 1]
-  4. `web_fallback`: If KB results remain weak after retry, search the live web via `duckduckgo-search` (or Tavily) and synthesize a web-grounded answer clearly tagged as `source_mode="web_fallback"` with source URLs
+  4. `web_fallback`: If KB results remain weak after retry, search the live web via Tavily (`tavily-python`) and synthesize a web-grounded answer clearly tagged as `source_mode="web_fallback"` with source URLs
   5. `generate_answer`: Synthesize a grounded answer with inline citations `[filename · p.X]`[cite: 1]
 - **Lightweight Hackathon Storage & Cache:** In-memory Python dict cache (simulating Redis hit/miss telemetry) and local ChromaDB + JSON metadata (skip PostgreSQL/Docker until after the hackathon demo)[cite: 1].
 - **Frontend:** React + TypeScript + Tailwind CSS + Lucide React + Recharts (`frontend/`), styled in a **Swiss Technical Grid** aesthetic (`#F6F5F0` off-white background, `#111111` ink, `1px` `#D4D2C8` borders, `#FF4F00` signal-orange accents, `JetBrains Mono` metrics, zero dark-mode AI slop/glassmorphism).

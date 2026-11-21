@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.schemas.rag import QueryRequest, QueryResponse, ChunkResult, DocumentInfo
 from app.services.hybrid_engine import hybrid_engine
+from app.services.agent_graph import agent_app
 
 app = FastAPI(
     title="VeriRAG Engine",
@@ -77,40 +78,41 @@ def query_rag(request: QueryRequest):
             latency_ms=latency_ms
         )
 
-    trace_steps = ["start", "retrieve_hybrid_rrf"]
-    chunks: List[ChunkResult] = hybrid_engine.hybrid_search(request.query, top_k=request.top_k)
+    initial_state = {
+        "question": request.query,
+        "rewritten_query": None,
+        "retry_count": 0,
+        "chunks": [],
+        "web_sources": [],
+        "source_mode": "none",
+        "trace_steps": ["start_workflow"],
+        "answer": ""
+    }
 
-    if not chunks:
+    try:
+        final_state = agent_app.invoke(initial_state)
+    except Exception as e:
         latency_ms = round((time.time() - start_time) * 1000, 2)
         return QueryResponse(
-            answer="No relevant documents or chunks found in the knowledge base. Please upload a PDF.",
+            answer=f"Error executing agent pipeline: {str(e)}",
             source_mode="none",
-            trace_steps=trace_steps + ["no_results"],
+            trace_steps=["start_workflow", f"error: {str(e)}"],
             chunks=[],
             web_sources=[],
             cache_hit=False,
             latency_ms=latency_ms
         )
 
-    trace_steps.append("generate_grounded_answer")
-    try:
-        answer = hybrid_engine.generate_answer(request.query, chunks)
-    except Exception as e:
-        answer = f"Error generating answer: {str(e)}"
-
-    trace_steps.append("completed")
     latency_ms = round((time.time() - start_time) * 1000, 2)
-
     result_data = {
-        "answer": answer,
-        "source_mode": "hybrid_kb",
-        "trace_steps": trace_steps,
-        "chunks": chunks,
-        "web_sources": [],
+        "answer": final_state.get("answer", ""),
+        "source_mode": final_state.get("source_mode", "none"),
+        "trace_steps": final_state.get("trace_steps", []),
+        "chunks": final_state.get("chunks", []),
+        "web_sources": final_state.get("web_sources", []),
         "cache_hit": False,
         "latency_ms": latency_ms
     }
 
     query_cache[cache_key] = result_data
-
     return QueryResponse(**result_data)

@@ -458,8 +458,11 @@ export default function App() {
                     {/* Metrics Row */}
                     <div className="grid grid-cols-3 gap-1 bg-[#EFECE1] border border-[#D4D2C8] p-1.5 text-center font-mono text-[11px]">
                       <div>
-                        <div className="text-[9px] text-[#777777]">RRF SCORE</div>
-                        <div className="font-bold text-[#FF4F00]">{c.rrf_score}</div>
+                        <div className="text-[9px] text-[#777777]">RRF MATCH</div>
+                        <div className="font-bold text-[#FF4F00]">
+                          {/* Convert RRF raw score (max 2/61 = 0.032787) into an intuitive 0-100% confidence match */}
+                          {(Math.min(100, (c.rrf_score / 0.032787) * 100)).toFixed(1)}%
+                        </div>
                       </div>
                       <div>
                         <div className="text-[9px] text-[#777777]">BM25 RANK</div>

@@ -35,16 +35,31 @@ class BatchRelevanceGrade(BaseModel):
     grades: List[ChunkGrade] = Field(description="List of relevance judgements for each evaluated snippet")
 
 
-def generate_content_with_retry(client, model: str, contents: str, config=None, max_retries: int = 3):
-    """Executes client.models.generate_content with exponential backoff on 503 or transient errors."""
+TRANSIENT_ERRORS = (
+    "503",
+    "UNAVAILABLE",
+    "high demand",
+    "10053",
+    "10054",
+    "connection was aborted",
+    "connection reset",
+    "RemoteDisconnected",
+    "timeout",
+    "timed out"
+)
+
+
+def generate_content_with_retry(client, model: str, contents: str, config=None, max_retries: int = 4):
+    """Executes client.models.generate_content with exponential backoff on transient network or 503 errors."""
     for attempt in range(max_retries):
         try:
             return client.models.generate_content(model=model, contents=contents, config=config)
         except Exception as e:
-            err_msg = str(e)
-            if ("503" in err_msg or "UNAVAILABLE" in err_msg or "high demand" in err_msg) and attempt < max_retries - 1:
+            err_msg = str(e).lower()
+            is_transient = any(trigger.lower() in err_msg for trigger in TRANSIENT_ERRORS)
+            if is_transient and attempt < max_retries - 1:
                 wait_sec = (attempt + 1) * 2
-                logger.warning(f"503 received from Gemini API. Retrying in {wait_sec}s (attempt {attempt + 1}/{max_retries})...")
+                logger.warning(f"Transient error ({type(e).__name__}: {str(e)[:80]}). Retrying in {wait_sec}s (attempt {attempt + 1}/{max_retries})...")
                 time.sleep(wait_sec)
             else:
                 raise e
@@ -53,7 +68,10 @@ def generate_content_with_retry(client, model: str, contents: str, config=None, 
 def get_gemini_client():
     if not settings.GEMINI_API_KEY:
         raise ValueError("GEMINI_API_KEY is not configured.")
-    return genai.Client(api_key=settings.GEMINI_API_KEY)
+    return genai.Client(
+        api_key=settings.GEMINI_API_KEY,
+        http_options=types.HttpOptions(timeout=60.0)
+    )
 
 
 # Node 1: retrieve_kb (Optimized to top 3 chunks for high-speed evaluation)
@@ -90,17 +108,19 @@ def grade_relevance(state: AgentState) -> dict:
     )
 
     prompt = f"""You are an auditable technical retrieval grader.
-Evaluate whether each of the following context snippets contains information relevant to answering the question.
+Evaluate whether each of the following context snippets contains information relevant to answering or explaining any aspect of the user's question.
+Be generous: if a snippet mentions related topics, domain concepts, data fields, entities, or background information that helps answer the question, mark it as true. Only mark as false if it is completely unrelated.
 
-Question:
+User Question:
 {question}
 
 Context Snippets:
 {snippets_text}
 
-For each snippet from 1 to {len(chunks)}, determine if it is relevant (true) or not (false)."""
+For each snippet from 1 to {len(chunks)}, determine if it is relevant (true) or completely irrelevant (false)."""
 
     grade_map = {}
+    grading_succeeded = False
     try:
         response = generate_content_with_retry(
             client=client,
@@ -117,13 +137,18 @@ For each snippet from 1 to {len(chunks)}, determine if it is relevant (true) or 
             idx = item.get("chunk_index")
             if idx is not None and 1 <= idx <= len(chunks):
                 grade_map[idx - 1] = bool(item.get("is_relevant", False))
+        grading_succeeded = True
     except Exception as e:
         logger.warning(f"Batch grading fallback triggered: {e}")
+        grading_succeeded = False
 
     graded_chunks = []
     relevant_count = 0
     for i, chunk in enumerate(chunks):
-        is_rel = grade_map.get(i, False)
+        # Strict gate: Only mark relevant if the LLM explicitly judged it as True
+        # If grading failed/timed out, mark as False (do not assume relevance without evidence)
+        is_rel = grade_map.get(i, False) if grading_succeeded else False
+
         chunk_dict = chunk.model_dump()
         chunk_dict["is_relevant"] = is_rel
         graded_chunks.append(ChunkResult(**chunk_dict))
@@ -140,7 +165,12 @@ For each snippet from 1 to {len(chunks)}, determine if it is relevant (true) or 
 # Conditional Edge Router
 def route_after_grading(state: AgentState) -> str:
     chunks = state.get("chunks", [])
-    relevant_chunks = [c for c in chunks if c.is_relevant is True]
+    # Confidence gating: Only consider chunks that are graded relevant AND have legitimate dual-retriever or high RRF confidence (> 65% match)
+    # A chunk with RRF <= 0.016393 (50%) only matched vector cosine noise with 0 BM25 hits
+    relevant_chunks = [
+        c for c in chunks 
+        if c.is_relevant is True and (c.bm25_rank is not None or c.rrf_score > 0.020)
+    ]
     retry_count = state.get("retry_count", 0)
 
     if relevant_chunks:
@@ -228,6 +258,12 @@ def generate_answer(state: AgentState) -> dict:
         prompt = f"""You are VeriRAG, an auditable technical RAG assistant.
 Answer the user's question accurately using ONLY the provided context snippets.
 Cite the source for every factual statement using inline citations formatted exactly as: [filename · p.X].
+
+Structure your answer with:
+1. Direct Explanation / Core Findings (with inline citations [filename · p.X])
+2. Key Points / Technical Details
+3. Conclusion / Executive Summary (synthesizing the key takeaways clearly)
+
 If the context does not contain enough information to answer the question, state clearly what is missing.
 
 Context:
@@ -246,11 +282,19 @@ Answer:"""
             )
             answer = response.text.strip()
             final_mode = "kb"
+            trace_steps.append("Synthesized grounded answer from Knowledge Base with inline citations [filename · p.X]")
         except Exception as e:
-            answer = f"Error generating answer: {str(e)}"
+            logger.warning(f"KB synthesis encountered error/timeout: {e}. Falling back to structured extractive answer.")
+            # Resilient Extractive Fallback: deliver the relevant knowledge base chunks directly
+            lines = [
+                f"**Extracted Knowledge Base Findings for:** *{question}*\n",
+                f"*(Note: LLM synthesis encountered a transient network timeout; displaying verified excerpts directly from your document)*\n"
+            ]
+            for c in relevant_chunks:
+                lines.append(f"**From [{c.source} · p.{c.page}]:**\n> {c.text.strip()}\n")
+            answer = "\n".join(lines)
             final_mode = "kb"
-
-        trace_steps.append("Synthesized grounded answer from Knowledge Base with inline citations [filename · p.X]")
+            trace_steps.append("Directly presented relevant Knowledge Base passages with [filename · p.X] citations")
 
     elif web_sources:
         # Web Grounded Synthesis
@@ -262,6 +306,11 @@ Answer:"""
         prompt = f"""You are VeriRAG, an auditable technical RAG assistant operating in Web Fallback mode.
 Answer the user's question accurately using the live web search results below.
 Cite every factual claim with markdown hyperlinks formatted exactly as: [Title](URL).
+
+Structure your answer with:
+1. Direct Answer & Verified Facts (citing [Title](URL))
+2. Supporting Context & Details
+3. Executive Summary / Conclusion
 
 Web Search Results:
 {context_str}
@@ -279,11 +328,19 @@ Answer:"""
             )
             answer = response.text.strip()
             final_mode = "web_fallback"
+            trace_steps.append("Synthesized web-grounded answer from Tavily search with markdown links [Title](URL)")
         except Exception as e:
-            answer = f"Error generating web-fallback answer: {str(e)}"
+            logger.warning(f"Gemini web synthesis error, falling back to direct extractive web summary: {e}")
+            # Resilient fallback: build structured web summary directly from retrieved Tavily sources
+            summary_lines = [
+                f"**Web Search Results for:** *{question}*\n",
+                f"*(Note: LLM synthesis encountered a transient network delay; showing direct verified extracts from Tavily)*\n"
+            ]
+            for ws in web_sources:
+                summary_lines.append(f"- **[{ws.title}]({ws.url})**\n  {ws.snippet}\n")
+            answer = "\n".join(summary_lines)
             final_mode = "web_fallback"
-
-        trace_steps.append("Synthesized web-grounded answer from Tavily search with markdown links [Title](URL)")
+            trace_steps.append("Directly formatted Tavily web search sources into structured summary")
 
     else:
         answer = "No relevant information found in the internal knowledge base or web search."
